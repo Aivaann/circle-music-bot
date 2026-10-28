@@ -318,6 +318,7 @@ async def circle_with_music(
         raise CircleMusicError("не удалось выбрать трек")
 
     workdir = Path(tempfile.mkdtemp(prefix="circle_music_"))
+    started = time.monotonic()
     try:
         source = workdir / "source.mp4"
         target = workdir / "result.mp4"
@@ -327,6 +328,7 @@ async def circle_with_music(
             await telegram_file.download_to_drive(custom_path=str(source))
         except Exception as exc:
             raise CircleMusicError(f"не удалось скачать кружочек: {exc}") from exc
+        downloaded = time.monotonic() - started
 
         try:
             result = await asyncio.to_thread(
@@ -338,11 +340,18 @@ async def circle_with_music(
                 keep_voice=circle_music_keep_voice(),
                 ffmpeg_path=FFMPEG_PATH or None,
                 ffprobe_path=FFPROBE_PATH or None,
+                # Telegram уже знает длительность — не тратим ~1.5 с на ffprobe
+                duration=(
+                    float(note.duration)
+                    if getattr(note, "duration", None)
+                    else None
+                ),
             )
         except music_tools.FFmpegMissing as exc:
             raise CircleMusicError(str(exc)) from exc
         except music_tools.FFmpegError as exc:
             raise CircleMusicError(f"ffmpeg: {exc}") from exc
+        mixed = time.monotonic() - started
 
         kwargs: dict = {
             "duration": max(1, round(result.duration)),
@@ -362,8 +371,15 @@ async def circle_with_music(
                 )
         except Exception as exc:
             raise CircleMusicError(f"Telegram не принял кружочек: {exc}") from exc
+        uploaded = time.monotonic() - started
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+    print(
+        f"[circle] {chat_id}: скачивание {downloaded:.1f} c, "
+        f"ffmpeg {mixed - downloaded:.1f} c, отправка {uploaded - mixed:.1f} c, "
+        f"всего {uploaded:.1f} c"
+    )
 
     remember_sent_circle(chat_id, sent.message_id)
 
@@ -854,10 +870,24 @@ def build_app() -> Application:
         ApplicationBuilder()
         .token(TOKEN)
         .post_init(post_init)
-        .connect_timeout(20.0)
-        .read_timeout(20.0)
-        .write_timeout(20.0)
+        # Сеть до Telegram рвётся: ~40% новых TCP-соединений виснут намертво.
+        # Короткий connect_timeout превращает такое зависание в быстрый
+        # повтор (PTB сам делает до 3 попыток), а не в минуту ожидания.
+        .connect_timeout(5.0)
+        .write_timeout(30.0)
         .pool_timeout(5.0)
+        .media_write_timeout(60.0)
+        # Закачка кружочка идёт потоком — 15 с тишины в сокете уже авария,
+        # но на всякий случай даём больше времени.
+        .read_timeout(20.0)
+        # Опрос живёт отдельным клиентом: у него длинный read_timeout,
+        # иначе long polling будет рваться на каждом цикле.
+        .get_updates_connect_timeout(5.0)
+        .get_updates_read_timeout(25.0)
+        .get_updates_pool_timeout(5.0)
+        # Держим соединения живыми: переиспользовать готовый сокет надёжнее,
+        # чем открывать новый (новые то проходят, то нет).
+        .socket_options([(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)])
     )
     if PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)

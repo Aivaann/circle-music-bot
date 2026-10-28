@@ -331,13 +331,30 @@ def _run(args: list[str], timeout: int = 300) -> None:
         raise FFmpegError("ffmpeg: " + (" | ".join(tail) or "неизвестная ошибка"))
 
 
-def _random_offset(music: Path, duration: float, ffprobe_path: str | None) -> float:
-    """Чтобы один и тот же трек не начинался одинаково, берём случайный кусок."""
+_MUSIC_DURATION_CACHE: dict[tuple[str, int], float] = {}
+
+
+def _music_duration(music: Path, ffprobe_path: str | None) -> float:
+    """Длительность трека с кэшем: запуск ffprobe на Windows стоит ~1.5 с."""
     try:
-        info = probe(music, ffprobe_path)
-        music_duration = media_duration(info)
+        stat = music.stat()
+    except OSError:
+        return 0.0
+    key = (str(music), stat.st_mtime_ns)
+    cached = _MUSIC_DURATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        value = media_duration(probe(music, ffprobe_path))
     except (FFmpegError, FFmpegMissing):
         return 0.0
+    _MUSIC_DURATION_CACHE[key] = value
+    return value
+
+
+def _random_offset(music: Path, duration: float, ffprobe_path: str | None) -> float:
+    """Чтобы один и тот же трек не начинался одинаково, берём случайный кусок."""
+    music_duration = _music_duration(music, ffprobe_path)
     if music_duration <= duration + 2:
         return 0.0
     return round(random.uniform(0.0, min(30.0, music_duration - duration - 0.5)), 2)
@@ -353,6 +370,7 @@ def mix_video(
     ffmpeg_path: str | None = None,
     ffprobe_path: str | None = None,
     music_offset: float | None = None,
+    duration: float | None = None,
 ) -> MixResult:
     """Добавляет музыку к видео и пишет результат в target.
 
@@ -361,25 +379,40 @@ def mix_video(
     повторяем без неё, компенсируя громкость.
     """
     ffmpeg = find_tool("ffmpeg", ffmpeg_path)
-    info = probe(source, ffprobe_path)
-    duration = min(media_duration(info), MAX_VIDEO_NOTE_SECONDS)
+    if duration and duration > 0:
+        # Длительность уже известна из Telegram (video_note.duration) —
+        # не запускаем ffprobe, это ~1.5 с на Windows.
+        duration = min(float(duration), MAX_VIDEO_NOTE_SECONDS)
+        source_audio: bool | None = None
+    else:
+        info = probe(source, ffprobe_path)
+        duration = min(media_duration(info), MAX_VIDEO_NOTE_SECONDS)
+        source_audio = has_audio(info)
     if duration <= 0:
         raise FFmpegError("Не удалось определить длительность видео")
-    source_audio = has_audio(info)
 
     target.parent.mkdir(parents=True, exist_ok=True)
 
     if music_offset is None:
         music_offset = _random_offset(music, duration, ffprobe_path)
 
-    attempts = [
-        dict(copy_video=True, normalize=True, gain=1.0),
+    attempts = [dict(copy_video=True, normalize=True, gain=1.0)]
+    if source_audio is None and keep_voice:
+        # Про звук в источнике неизвестно. Если дорожки нет, все варианты
+        # с [0:a] упадут — поэтому сразу пробуем без голоса, не тратя
+        # время на перекодирование впустую.
+        attempts.append(
+            dict(copy_video=True, normalize=True, gain=1.0, keep_voice=False)
+        )
+    attempts += [
         dict(copy_video=False, normalize=True, gain=1.0),
         dict(copy_video=False, normalize=False, gain=2.0),
     ]
 
     last_error: Exception | None = None
     for attempt in attempts:
+        params = dict(attempt)
+        attempt_voice = params.pop("keep_voice", keep_voice)
         args = build_args(
             source,
             music,
@@ -387,10 +420,10 @@ def mix_video(
             duration=duration,
             ffmpeg=ffmpeg,
             volume=volume,
-            keep_voice=keep_voice,
-            source_has_audio=source_audio,
+            keep_voice=attempt_voice,
+            source_has_audio=source_audio is not False,
             music_offset=music_offset,
-            **attempt,
+            **params,
         )
         try:
             _run(args)
@@ -399,7 +432,8 @@ def mix_video(
             continue
 
         if target.is_file() and target.stat().st_size > 0:
-            return MixResult(target, duration, keep_voice and source_audio)
+            voice_kept = attempt_voice and source_audio is not False
+            return MixResult(target, duration, voice_kept)
 
         last_error = FFmpegError("ffmpeg не создал выходной файл")
 
