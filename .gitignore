@@ -1,0 +1,24 @@
+# Секреты и локальные данные — не коммитим
+.env
+
+# Настройки бота (выбранный трек, громкость и т. п.)
+settings.json
+settings.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Музыка для кружочков: личные треки в git не нужны
+music/*
+!music/README.md
+
+# Мусор от запусков
+run_out.txt
+run_err.txt
+
+# На случай, если рядом осталась база старого бота
+*.db
+*.db-journal
