@@ -277,6 +277,11 @@ async def delete_circle_source(
             )
 
 
+DELETE_BUTTON = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🗑 Удалить", callback_data="circle:delete")]]
+)
+
+
 async def circle_with_music(
     context: ContextTypes.DEFAULT_TYPE,
     msg: Message,
@@ -284,6 +289,7 @@ async def circle_with_music(
     connection_id: str | None = None,
     *,
     delete_original: bool = False,
+    delete_button: bool = False,
 ) -> Message:
     """Скачивает кружочек, добавляет музыку и отправляет новую версию.
 
@@ -344,6 +350,8 @@ async def circle_with_music(
         }
         if connection_id:
             kwargs["business_connection_id"] = connection_id
+        if delete_button:
+            kwargs["reply_markup"] = DELETE_BUTTON
 
         try:
             with target.open("rb") as handle:
@@ -521,7 +529,8 @@ def help_text() -> str:
         "🎵 <b>Музыка для кружочков</b>\n\n"
         "Отправьте кружочек в личный чат (Business) — вернётся версия "
         "с музыкой, оригинал удалится.\n\n"
-        "Проверка: пришлите кружочек мне — верну его же с музыкой.\n\n"
+        "Проверка: пришлите кружочек мне — верну его же с музыкой. "
+        "Под ним будет кнопка «🗑 Удалить».\n\n"
         f"Треков в папке <code>{html.escape(str(MUSIC_DIR))}</code>: "
         f"{len(tracks)}.\n"
         f"Business: {business_status()}\n"
@@ -593,7 +602,9 @@ async def send_circle_to_self(
 
     status = await msg.reply_text("🎵 Накладываю музыку…")
     try:
-        await circle_with_music(context, msg, OWNER_ID)
+        await circle_with_music(
+            context, msg, OWNER_ID, delete_button=True
+        )
     except CircleMusicError as exc:
         await status.edit_text(f"⚠️ Не получилось: {exc}")
         return
@@ -603,7 +614,7 @@ async def send_circle_to_self(
 
     await status.edit_text(
         "🎵 Готово — кружочек с музыкой ниже.\n"
-        "Перешлите его в нужный чат. Настройки: /music"
+        "Перешлите его в нужный чат или нажмите «🗑 Удалить» под ним."
     )
 
 
@@ -625,6 +636,24 @@ async def on_owner_message(
     )
 
 
+async def delete_circle_message(
+    query, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Кнопка «🗑 Удалить» под кружочком в личке с ботом."""
+    msg = query.message
+    if msg is None:
+        await query.answer("Сообщение уже недоступно")
+        return
+    try:
+        await context.bot.delete_message(
+            chat_id=msg.chat_id, message_id=msg.message_id
+        )
+    except Exception as exc:
+        await query.answer(f"Не удалось удалить: {exc}", show_alert=True)
+        return
+    await query.answer("Кружочек удалён")
+
+
 async def on_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -636,6 +665,12 @@ async def on_callback(
         return
 
     action, _, arg = (query.data or "").partition(":")
+    if action == "circle":
+        if arg == "delete":
+            await delete_circle_message(query, context)
+        else:
+            await query.answer()
+        return
     if action != "music":
         await query.answer()
         return
