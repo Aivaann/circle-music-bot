@@ -29,7 +29,7 @@ Telegram Business.
 
 1. Установить зависимости:
    ```
-   py -m pip install "python-telegram-bot>=21.10"
+   py -m pip install -r requirements.txt
    winget install Gyan.FFmpeg
    ```
    После установки ffmpeg перезапустите терминал (или укажите путь в
