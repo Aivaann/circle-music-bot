@@ -26,19 +26,23 @@ import json
 import shutil
 import socket
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
     LinkPreviewOptions,
     Message,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -118,6 +122,9 @@ DEFAULT_SETTINGS = {
 }
 
 settings: dict = dict(DEFAULT_SETTINGS)
+
+# Одно стартовое сообщение на процесс, даже если бот перезапускается сам
+_startup_notified = False
 
 MAX_SENT_CIRCLES = 200
 VOLUME_PRESETS = (0.10, 0.18, 0.35)
@@ -671,22 +678,53 @@ async def post_init(application) -> None:
     if not tracks:
         print("[!] Положите mp3/m4a/ogg/wav/flac в папку music/.")
 
+    # Постоянная клавиатура старого бота («Люди», «Заметки», ...) живёт в
+    # клиенте бессрочно, пока её не уберут сообщением с ReplyKeyboardRemove.
+    # После автоперезапуска не повторяем: одного раза достаточно.
+    global _startup_notified
+    if not _startup_notified:
+        try:
+            await application.bot.send_message(
+                OWNER_ID,
+                "🎵 Бот запущен. Старая панель убрана — управление в /music.",
+                reply_markup=ReplyKeyboardRemove(),
+                disable_notification=True,
+            )
+            _startup_notified = True
+        except Exception as exc:
+            print(f"[!] Не удалось убрать старую клавиатуру: {exc}")
+
+    # Меню команд у кнопки «/» в клиенте Telegram.
+    try:
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", "Справка"),
+                BotCommand("music", "Музыка: трек, громкость, оригинал"),
+            ]
+        )
+    except Exception as exc:
+        print(f"[!] Не удалось обновить меню команд: {exc}")
+
 
 # --- Запуск ----------------------------------------------------------------
 
-def main() -> None:
-    load_settings()
-
-    builder = ApplicationBuilder().token(TOKEN)
-    builder = builder.post_init(post_init)
+def build_app() -> Application:
+    """Собирает приложение с обработчиками (пересобирается после падений)."""
+    builder = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .connect_timeout(20.0)
+        .read_timeout(20.0)
+        .write_timeout(20.0)
+        .pool_timeout(5.0)
+    )
     if PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
-        print(f"Подключение через прокси: {PROXY_URL}")
-    else:
-        print(f"Подключение через рабочий IP Telegram: {API_IP}")
+    return builder.build()
 
-    app = builder.build()
 
+def add_handlers(app: Application) -> None:
     app.add_handler(
         CommandHandler(
             ["start", "help"], cmd_start, filters=filters.Chat(OWNER_ID)
@@ -711,8 +749,35 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
 
+
+def main() -> None:
+    load_settings()
+
+    if PROXY_URL:
+        print(f"Подключение через прокси: {PROXY_URL}")
+    else:
+        print(f"Подключение через рабочий IP Telegram: {API_IP}")
     print("Бот с музыкой для кружочков запущен. Ctrl+C — остановить.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+
+    # Сеть до Telegram периодически отваливается (ConnectTimeout на getMe или
+    # на long polling). run_polling возвращает управление только при остановке,
+    # поэтому любое исключение здесь — повод собрать приложение заново.
+    while True:
+        app = build_app()
+        add_handlers(app)
+        try:
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+                bootstrap_retries=-1,
+            )
+            break
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            print(f"[!] Бот упал: {type(exc).__name__}: {exc}")
+            print("[i] Перезапуск через 15 секунд…")
+            time.sleep(15)
 
 
 if __name__ == "__main__":
