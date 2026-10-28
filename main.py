@@ -23,6 +23,7 @@
 import asyncio
 import html
 import json
+import logging
 import shutil
 import socket
 import tempfile
@@ -44,6 +45,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    BusinessConnectionHandler,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -119,6 +121,7 @@ DEFAULT_SETTINGS = {
     "delete_original": True,  # удалять исходный кружочек после переотправки
     "track": "random",        # имя файла из music/ или "random"
     "sent_circles": [],       # [[chat_id, message_id], ...] чтобы не ловить эхо
+    "business": None,         # последнее подключение к Business-аккаунту
 }
 
 settings: dict = dict(DEFAULT_SETTINGS)
@@ -128,6 +131,27 @@ _startup_notified = False
 
 MAX_SENT_CIRCLES = 200
 VOLUME_PRESETS = (0.10, 0.18, 0.35)
+
+# Права Business-бота, которые нам важны (см. /start)
+RIGHT_NAMES = {
+    "can_read_messages": "читать сообщения",
+    "can_reply": "отвечать",
+    "can_delete_sent_messages": "удалять свои сообщения",
+    "can_delete_all_messages": "удалять все сообщения",
+}
+
+
+def business_status() -> str:
+    """Строка о подключении к Business — её видно в /start."""
+    data = settings.get("business")
+    if not isinstance(data, dict):
+        return "нет данных (подключите бота в Business-настройках)"
+    if not data.get("enabled"):
+        return "бот отключён от аккаунта"
+    rights = data.get("rights") or []
+    if not rights:
+        return "подключён, права не переданы"
+    return "подключён, права: " + ", ".join(rights)
 
 
 def load_settings() -> None:
@@ -498,12 +522,42 @@ def help_text() -> str:
         "Отправьте кружочек в личный чат (Business) — вернётся версия "
         "с музыкой, оригинал удалится.\n\n"
         "Проверка: пришлите кружочек мне — верну его же с музыкой.\n\n"
-        f"Треков в папке <code>{html.escape(str(MUSIC_DIR))}</code>: {len(tracks)}.\n"
+        f"Треков в папке <code>{html.escape(str(MUSIC_DIR))}</code>: "
+        f"{len(tracks)}.\n"
+        f"Business: {business_status()}\n"
         "Настройки: /music"
     )
 
 
 # --- Обработчики ------------------------------------------------------------
+
+async def on_business_connection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Telegram сообщает о подключении бота к Business-аккаунту и его правах."""
+    conn = update.business_connection
+    if conn is None:
+        return
+
+    rights = []
+    for name, title in RIGHT_NAMES.items():
+        if conn.rights is not None and getattr(conn.rights, name, False):
+            rights.append(title)
+
+    set_setting(
+        "business",
+        {
+            "id": conn.id,
+            "user_id": conn.user.id,
+            "enabled": bool(conn.is_enabled),
+            "rights": rights,
+        },
+    )
+    print(
+        f"[business] подключение {conn.id}: включено={conn.is_enabled}, "
+        f"права={', '.join(rights) or 'нет'}"
+    )
+
 
 async def on_business_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -665,6 +719,54 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"[!] Ошибка: {type(error).__name__}: {error}")
 
 
+def describe_message(msg: Message) -> str:
+    """Короткое описание сообщения для лога."""
+    if msg.video_note:
+        kind = "кружочек"
+    elif msg.text:
+        kind = f"текст {msg.text[:40]!r}"
+    elif msg.photo:
+        kind = "фото"
+    else:
+        kind = "другое"
+    if msg.from_user is None:
+        who = "?"
+    else:
+        who = msg.from_user.username or str(msg.from_user.id)
+    return f"chat={msg.chat_id} from={who} {kind}"
+
+
+async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Печатает каждый апдейт — сразу видно, доходят ли сообщения до бота."""
+    msg = update.business_message or update.effective_message
+    if msg is None:
+        return
+    where = "business" if update.business_message else "личка"
+    print(f"[upd] {where}: {describe_message(msg)}")
+
+
+async def heartbeat_loop(application: Application) -> None:
+    """Строка раз в минуту: видно, что опрос Telegram действительно идёт."""
+    while True:
+        await asyncio.sleep(60)
+        updater = application.updater
+        polling = bool(updater and updater.running)
+        state = "идёт" if polling else "ОСТАНОВЛЕН"
+        print(f"[i] {datetime.now():%H:%M:%S} опрос Telegram: {state}")
+
+
+def setup_logging() -> None:
+    """Логи python-telegram-bot в консоль: иначе ошибки опроса не видны."""
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.INFO,
+    )
+    # httpx пишет строку на каждый HTTP-запрос — слишком шумно.
+    for noisy in ("httpx", "httpcore", "telegram.request"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 async def post_init(application) -> None:
     """Показывает при запуске, всё ли готово к работе."""
     try:
@@ -705,6 +807,9 @@ async def post_init(application) -> None:
     except Exception as exc:
         print(f"[!] Не удалось обновить меню команд: {exc}")
 
+    application.create_task(heartbeat_loop(application))
+    # Предупреждение PTB про create_task не мешает: задача живёт до остановки.
+
 
 # --- Запуск ----------------------------------------------------------------
 
@@ -725,6 +830,8 @@ def build_app() -> Application:
 
 
 def add_handlers(app: Application) -> None:
+    # Группа -1: журнал всех сообщений, обработку не прерывает.
+    app.add_handler(MessageHandler(filters.ALL, log_update), group=-1)
     app.add_handler(
         CommandHandler(
             ["start", "help"], cmd_start, filters=filters.Chat(OWNER_ID)
@@ -747,10 +854,12 @@ def add_handlers(app: Application) -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_error_handler(on_error)
 
 
 def main() -> None:
+    setup_logging()
     load_settings()
 
     if PROXY_URL:
